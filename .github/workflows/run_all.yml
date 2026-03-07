@@ -1,0 +1,117 @@
+name: Run All
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Pass commit=true to commit downloaded files'
+        required: false
+        default: 'false'
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger download workflow
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          COMMIT_INPUT: ${{ github.event.inputs.commit }}
+        run: |
+          REF=main
+          WF=download_xls.yml
+          echo "Triggering workflow $WF on $REPO (ref=$REF)"
+          curl -s -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            https://api.github.com/repos/${REPO}/actions/workflows/${WF}/dispatches \
+            -d '{"ref":"'${REF}'","inputs":{"commit":"'${COMMIT_INPUT}'"}}'
+
+      - name: Wait for download workflow to start and complete
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          WF=download_xls.yml
+          echo "Waiting for run of $WF to appear..."
+          # wait for the run to be created
+          for i in $(seq 1 60); do
+            resp=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/actions/workflows/${WF}/runs?per_page=5")
+            run_id=$(echo "$resp" | jq -r '.workflow_runs[0].id // empty')
+            created_at=$(echo "$resp" | jq -r '.workflow_runs[0].created_at // empty')
+            if [ -n "$run_id" ]; then
+              echo "Found run_id=$run_id created_at=$created_at"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$run_id" ]; then
+            echo "No recent run found for $WF" && exit 1
+          fi
+          echo "Polling run $run_id until completion..."
+          for i in $(seq 1 180); do
+            status=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/actions/runs/${run_id}" | jq -r '.status')
+            conclusion=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/actions/runs/${run_id}" | jq -r '.conclusion')
+            echo "status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ] || [ "$conclusion" = "neutral" ]; then
+                echo "Download workflow completed: $conclusion"
+                break
+              else
+                echo "Download workflow finished with conclusion=$conclusion" && exit 1
+              fi
+            fi
+            sleep 5
+          done
+
+      - name: Wait for parse workflow run (triggered by download)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          PARSE_WF=parse_after_download.yml
+          echo "Waiting for parse workflow run triggered by download..."
+          # try up to 180 loops (~15min)
+          for i in $(seq 1 180); do
+            resp=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/actions/workflows/${PARSE_WF}/runs?per_page=5")
+            run_id=$(echo "$resp" | jq -r '.workflow_runs[0].id // empty')
+            status=$(echo "$resp" | jq -r '.workflow_runs[0].status // empty')
+            conclusion=$(echo "$resp" | jq -r '.workflow_runs[0].conclusion // empty')
+            if [ -n "$run_id" ]; then
+              echo "Parse run found: id=$run_id status=$status conclusion=$conclusion"
+              if [ "$status" = "completed" ]; then
+                if [ "$conclusion" = "success" ] || [ "$conclusion" = "neutral" ]; then
+                  echo "Parse completed: $conclusion"
+                  PARSE_RUN_ID=$run_id
+                  break
+                else
+                  echo "Parse workflow failed: $conclusion" && exit 1
+                fi
+              fi
+            fi
+            sleep 5
+          done
+          if [ -z "$PARSE_RUN_ID" ]; then
+            echo "No completed parse run found" && exit 1
+          fi
+          echo "Parse run id: $PARSE_RUN_ID"
+
+      - name: Download parsed artifact from parse run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # fetch artifacts list for parse run
+          PARSE_WF=parse_after_download.yml
+          resp=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/actions/workflows/${PARSE_WF}/runs?per_page=5")
+          run_id=$(echo "$resp" | jq -r '.workflow_runs[0].id')
+          echo "Downloading artifacts for parse run $run_id"
+          arts=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/actions/runs/${run_id}/artifacts")
+          mkdir -p artifacts
+          echo "$arts" | jq -r '.artifacts[] | [.id, .name] | @tsv' | while IFS=$'\t' read -r id name; do
+            echo "Downloading artifact $name ($id)"
+            dl="https://api.github.com/repos/${REPO}/actions/artifacts/${id}/zip"
+            curl -sL -H "Authorization: Bearer ${GITHUB_TOKEN}" "$dl" -o /tmp/art.zip
+            unzip -o /tmp/art.zip -d artifacts || true
+          done
+          echo "Artifacts extracted to artifacts/"

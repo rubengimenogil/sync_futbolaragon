@@ -47,6 +47,7 @@ jobs:
         run: |
           ls -la downloads || true
 
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -61,7 +62,9 @@ jobs:
           BRANCH=$(git rev-parse --abbrev-ref HEAD)
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
+          # include current UTC timestamp in commit message
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           git add downloads || true
-          git commit -m "chore: update downloaded XLS files" || echo "No changes to commit"
+          git commit -m "update ${TS}" || echo "No changes to commit"
           git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}
           git push origin $BRANCH

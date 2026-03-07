@@ -6,7 +6,7 @@ on:
     types: [completed]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   parse:
@@ -32,6 +32,19 @@ jobs:
         run: |
           mkdir -p parsed
           python tools/fetch_and_parse_futbolaragon.py --js-file tercera_federacion.js --local-dir downloads --output parsed/out.json --verbose
+          
+      - name: Commit parsed JSON back to repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          git add parsed/out.json || true
+          git commit -m "update ${TS}" || echo "No changes to commit"
+          git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}
+          git push origin $BRANCH || echo "Push failed"
 
       - name: Upload parsed JSON artifact
         uses: actions/upload-artifact@v4
