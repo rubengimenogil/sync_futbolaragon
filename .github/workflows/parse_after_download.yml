@@ -26,13 +26,13 @@ jobs:
 
       - name: Install parser dependencies
         run: |
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests beautifulsoup4; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests curl_cffi beautifulsoup4; fi
 
       - name: Run parser on downloaded files
         run: |
           mkdir -p parsed
           python tools/fetch_and_parse_futbolaragon.py --js-file tercera_federacion.js --local-dir downloads --output parsed/out.json --verbose
-          
+
       - name: Commit parsed JSON back to repo
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

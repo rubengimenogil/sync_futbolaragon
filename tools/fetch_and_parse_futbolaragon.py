@@ -35,7 +35,7 @@ import json
 import argparse
 import hashlib
 import logging
-import requests
+from curl_cffi import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 import unicodedata
