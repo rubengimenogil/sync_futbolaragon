@@ -30,6 +30,7 @@ El JSON generado tiene la forma:
 """
 import re
 import sys
+import os
 import json
 import argparse
 import hashlib
@@ -37,6 +38,8 @@ import logging
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
+import unicodedata
+import glob
 
 # Alphabet usado en Apps Script (a..v + 0..9)
 B32_ALPHABET = "abcdefghijklmnopqrstuv0123456789"
@@ -97,6 +100,31 @@ def download_url(url, timeout=15, cookie_header=None):
     return resp.text, resp.headers
 
 
+def read_local_file(path):
+    # lee binario y decodifica intentando ISO-8859-1 / utf-8
+    with open(path, 'rb') as f:
+        data = f.read()
+    try:
+        text = data.decode('utf-8')
+    except Exception:
+        try:
+            text = data.decode('iso-8859-1')
+        except Exception:
+            text = data.decode('utf-8', errors='replace')
+    return text, {}
+
+
+def sanitize_name_for_filename(s):
+    # Normaliza acentos, reemplaza espacios por guion bajo y elimina caracteres raros
+    if not s:
+        return ''
+    s = unicodedata.normalize('NFKD', s)
+    s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.replace(' ', '_')
+    s = re.sub(r'[^A-Za-z0-9_\-]', '', s)
+    return s
+
+
 def extract_rows_from_html(html):
     # Usa BeautifulSoup para extraer <tr> y sus celdas
     soup = BeautifulSoup(html, 'html.parser')
@@ -105,8 +133,9 @@ def extract_rows_from_html(html):
         cells = []
         for cell in tr.find_all(['td', 'th']):
             text = cell.get_text(separator=' ', strip=True)
-            # normalizar NBSP
+            # normalizar NBSP y espacios multiples
             text = text.replace('\xa0', ' ')
+            text = re.sub(r'\s+', ' ', text)
             cells.append(text)
         if any(cells):
             rows.append(cells)
@@ -128,26 +157,63 @@ def parse_matches_from_rows(rows, competitionKey=None):
             continue
         if current_j is None:
             continue
-        # heurística: filas con al menos 5 columnas: [home, '-', away, campo, 'dd-mm-aaaa - hh:mm']
-        if len(r) >= 5:
-            home, sep, away = r[0].strip(), r[1].strip(), r[2].strip()
-            campo = r[3].strip() if len(r) > 3 else ''
-            fh = r[4].strip() if len(r) > 4 else ''
-            if home and sep == '-' and away and fh:
-                dt = parse_fecha_hora_local(fh)
-                start_iso = dt.isoformat() if dt else None
-                stable = build_stable_match_key(competitionKey or '', current_j, home, away)
-                event_id = build_deterministic_event_id(stable)
-                matches.append({
-                    'jornada': current_j,
-                    'home': home,
-                    'away': away,
-                    'location': campo or None,
-                    'start_iso': start_iso,
-                    'sourceText': fh,
-                    'stableKey': stable,
-                    'eventId': event_id
-                })
+        # heurística mejorada: buscar separador '-' en columnas o dentro de la primera columna
+        home = sep = away = campo = fh = None
+        # buscar columna con '-' exacto
+        dash_idx = None
+        for i, cell in enumerate(r):
+            if cell.strip() == '-':
+                dash_idx = i
+                break
+
+        if dash_idx is not None and dash_idx >= 1 and dash_idx + 1 < len(r):
+            home = r[dash_idx - 1].strip()
+            away = r[dash_idx + 1].strip()
+            # posible campo y fecha en siguientes columnas
+            if dash_idx + 2 < len(r) - 0:
+                campo = r[dash_idx + 2].strip()
+            if len(r) >= 1:
+                fh = r[-1].strip()
+        else:
+            # intentar 'Home - Away' en la primera celda
+            first = r[0].strip()
+            if ' - ' in first:
+                parts = [p.strip() for p in first.split(' - ', 1)]
+                if len(parts) == 2:
+                    home, away = parts[0], parts[1]
+                    # campo y fecha posiblemente al final
+                    if len(r) >= 2:
+                        campo = r[1].strip() if len(r) > 1 else ''
+                    fh = r[-1].strip() if len(r) > 1 else ''
+            else:
+                # fallback: si hay al menos 3 columnas asumimos home, sep, away
+                if len(r) >= 3:
+                    home = r[0].strip()
+                    sep = r[1].strip()
+                    away = r[2].strip()
+                    campo = r[3].strip() if len(r) > 3 else ''
+                    fh = r[4].strip() if len(r) > 4 else (r[-1].strip() if len(r) > 3 else '')
+
+        # validar y extraer fecha/hora
+        if fh:
+            dt = parse_fecha_hora_local(fh)
+        else:
+            dt = None
+
+        if home and away and ((sep and sep == '-') or (dash_idx is not None) or (home and away and dt)) and fh:
+            start_iso = dt.isoformat() if dt else None
+            stable = build_stable_match_key(competitionKey or '', current_j, home, away)
+            event_id = build_deterministic_event_id(stable)
+            matches.append({
+                'jornada': current_j,
+                'home': home,
+                'away': away,
+                'location': campo or None,
+                'start_iso': start_iso,
+                'sourceText': fh,
+                'stableKey': stable,
+                'eventId': event_id
+            })
     logging.info('parse_matches_from_rows: partidos detectados=%d (competitionKey=%s)', len(matches), competitionKey)
     return matches
 
@@ -199,6 +265,7 @@ def main():
     p.add_argument('--log-file', default=None, help='Fichero para volcar logs (opcional)')
     p.add_argument('--cookie', default=None, help='Cabecera Cookie a usar en las peticiones')
     p.add_argument('--timeout', type=int, default=15, help='Timeout en segundos para requests')
+    p.add_argument('--local-dir', default=None, help='Si se pasa, toma los .xls/html desde este directorio en vez de descargar')
     args = p.parse_args()
 
     # Configura logging
@@ -231,17 +298,69 @@ def main():
             source_url = source_map[c['sourceConst']]
         if c['compConst'] and c['compConst'] in comp_map:
             comp_key = comp_map[c['compConst']]
-        if not source_url:
+        if not source_url and not args.local_dir:
             # intentar si la constante source contiene URL literal en JS (rare)
             logging.warning('categoria %s no tiene sourceUrl resuelta, se omite', c['key'])
             continue
 
-        try:
-            html, headers = download_url(source_url, timeout=args.timeout, cookie_header=args.cookie)
-            logging.debug('Headers recibidos: %s', dict(headers))
-        except Exception as e:
-            logging.exception('ERROR descargando %s', source_url)
-            continue
+        # Si se indicó --local-dir, intentar leer fichero local equivalente
+        html = None
+        headers = {}
+        if args.local_dir:
+            name_map = find_constant_map(js_text, 'NAME_')
+            candidate_files = []
+            # intento: SOURCE_X -> NAME_X
+            if c.get('sourceConst'):
+                name_const = c['sourceConst'].replace('SOURCE_', 'NAME_')
+                name_val = name_map.get(name_const)
+                if name_val:
+                    fn = sanitize_name_for_filename(name_val) + '.xls'
+                    candidate_files.append(os.path.join(args.local_dir, fn))
+                    # también variar sin acentos/pasar espacios a guion bajo ya hecho; añadir versión sin acentos + spaces
+                    candidate_files.append(os.path.join(args.local_dir, name_val.replace(' ', '_') + '.xls'))
+
+            # fallback: buscar archivos que contengan la key o parte del nombre
+            pattern = os.path.join(args.local_dir, '*.xls')
+            for pth in glob.glob(pattern):
+                b = os.path.basename(pth).lower()
+                if c['key'].lower() in b:
+                    candidate_files.insert(0, pth)
+
+            # buscar coincidencias por cercanía al nombre original
+            found_file = None
+            for cand in candidate_files:
+                if cand and os.path.exists(cand):
+                    found_file = cand
+                    break
+            # si no hay candidato directo, buscar heurístico: nombre contenido
+            if not found_file:
+                for pth in glob.glob(pattern):
+                    b = os.path.basename(pth).lower()
+                    # eliminar guiones bajos y tildes para comparar
+                    norm = re.sub(r'[_\-]', ' ', b)
+                    norm = unicodedata.normalize('NFKD', norm)
+                    norm = ''.join(ch for ch in norm if not unicodedata.combining(ch))
+                    if c['key'].lower().replace('_', ' ') in norm or (c.get('sourceConst') and c['sourceConst'].lower().replace('source_', '') in norm):
+                        found_file = pth
+                        break
+
+            if found_file:
+                try:
+                    html, headers = read_local_file(found_file)
+                    logging.info('Usando fichero local %s para categoria %s', found_file, c['key'])
+                except Exception:
+                    logging.exception('ERROR leyendo fichero local %s', found_file)
+                    continue
+            else:
+                logging.warning('No se encontró fichero local para categoría %s en %s; intentando descarga', c['key'], args.local_dir)
+
+        if html is None:
+            try:
+                html, headers = download_url(source_url, timeout=args.timeout, cookie_header=args.cookie)
+                logging.debug('Headers recibidos: %s', dict(headers))
+            except Exception as e:
+                logging.exception('ERROR descargando %s', source_url)
+                continue
 
         rows = extract_rows_from_html(html)
         logging.info('categoria=%s rows_count=%d', c['key'], len(rows))

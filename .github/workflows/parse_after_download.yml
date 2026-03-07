@@ -1,0 +1,40 @@
+name: Parse FutbolAragon XLS
+
+on:
+  workflow_run:
+    workflows: ["Download FutbolAragon XLS"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Download artifacts from triggering workflow run
+        run: |
+          python tools/download_artifacts.py --event-path "${{ github.event_path }}" --repo "${{ github.repository }}" --token "${{ secrets.GITHUB_TOKEN }}" --out downloads
+
+      - name: Install parser dependencies
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests beautifulsoup4; fi
+
+      - name: Run parser on downloaded files
+        run: |
+          mkdir -p parsed
+          python tools/fetch_and_parse_futbolaragon.py --js-file tercera_federacion.js --local-dir downloads --output parsed/out.json --verbose
+
+      - name: Upload parsed JSON artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: futbolaragon-parsed-json
+          path: parsed/out.json
